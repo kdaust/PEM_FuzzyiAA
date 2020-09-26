@@ -1,0 +1,156 @@
+---
+title: "Stage 1 Post-sampling"
+author: "Kiri Daust"
+date: "7/25/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(lwgeom)
+library(raster)
+library(sp)
+library(gdistance)
+library(stars)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(foreach)
+library(doSNOW)
+library(stars)
+library(iterators)
+library(LearnGeom)
+library(tmap)
+library(viridis)
+library(shinyjs)
+library(formatR)
+```
+
+## Post Data Collection
+This script contains functionality for processing the collected transects. It is divided into three main sections: 
+
+1. Connect points to form line segments and covert to raster linked to site series calls
+2. Given a modelled map, use the transects for accuracy assesment
+3. Create a LHS training point set from all raster cells
+
+#### 1. Create raster triangle
+
+```{r import}
+setwd("C:/Users/Kiri Daust/Desktop/Deception_SamplingPlan/Stage1Analysis")
+mod <- raster("SSMap/map.tif") ### import modelled map
+modKey <- read.csv("SSMap/response_key.csv")[,-1] ### site series name key
+
+setwd("C:/Users/Kiri Daust/Desktop/Deception_SamplingPlan/Stage1Analysis")
+t1 <- st_read(dsn = "TransectData/SBSmc2_1.1_1_NA", layer = "SBSmc2new") %>% ###import point data
+  st_transform(3005) %>%
+  st_zm()
+
+###just for this one
+t1 <- t1[t1$TimeStamp == "2019-07-22",]
+t1 <- t1[t1$name != "Placemark 35",]
+#################################
+###put in correct order
+t1$Order <- gsub("\\D+","", t1$name)
+t1$Order[t1$name %in% c("POC","TP1","TP2","POT")] <- ""
+t1 <- distinct(t1, .keep_all = T)
+rownames(t1) <- t1$name
+### distance matrix to place TP1 and 2
+d <- st_distance(t1)
+d <- as.data.frame(d)
+rownames(d) <- t1$name
+colnames(d) <- t1$name
+
+###placement of TP1 and TP2
+for(i in c("TP1","TP2")){
+  temp <- rownames(d)[order(d[,i])[2:3]]
+  temp <- gsub("\\D+","",temp)
+  temp <- as.numeric(temp)
+  newID <- mean(temp)
+  t1$Order[t1$name == i] <- newID
+}
+t1$Order[t1$name == "POC"] <- -1
+t1$Order[t1$name == "POT"] <- Inf
+
+t1$Order <- as.numeric(t1$Order)
+t1 <- t1[order(t1$Order),]
+rownames(t1) <- NULL
+
+calls <- t1[,c("name","X2MapUnit")] %>% st_drop_geometry()
+
+###join points to create line segements (Colin Chisholm, adapted)
+lines <- cbind(t1, st_coordinates(t1)) %>% as_tibble() %>%
+  mutate(Xend = lead(X),
+         Yend = lead(Y)) %>%  # collect the coordinates of the next point
+  filter(!is.na(Yend)) %>%  # drops the last row (start point with no end)
+  unite(Start, X, Y, sep = " ") %>%
+  unite(End, Xend, Yend, sep = " ") %>%
+  gather(key = "Start_End", value = coords, Start, End) %>% # converts to long table format
+  dplyr::select(-geometry) %>%  # old point geometry is dropped
+  separate(coords, into = c("X", "Y"), sep = " ") %>%       # coordinate pairs are seperated
+  st_as_sf(coords = c("X", "Y"))  %>% # geometry is created for each point (start and end)
+  group_by(name) %>% # with the point ID created above it is now possible to cast multiple points to a single geometry
+  summarise() %>%
+  st_cast("LINESTRING") %>%
+  st_set_crs(st_crs(t1))
+
+lines <- merge(lines, calls, by = "name", all.x = TRUE)
+##st_write(lines, dsn = "TestTransect",layer = "lines", driver = "ESRI Shapefile")
+plot(lines["X2MapUnit"], main = "Line Segments")
+plot(t1["X2MapUnit"], add = T)
+
+lines <- lines %>% ### just to clean it up a bit
+  group_by(X2MapUnit) %>%
+  summarise()
+
+lBuff <- st_buffer(lines, dist = 2.5, endCapStyle = "FLAT", joinStyle = "MITRE") ###create buffer
+plot(lBuff, main = "Buffer")
+
+rTemp <- raster("CC_2.5m/DEM_cc.tif") ### to use as a template
+lBuff$X2MapUnit <- gsub("/","_",lBuff$X2MapUnit)
+lBuff <- merge(lBuff, modKey, by.x = "X2MapUnit", by.y = "category", all.x = T) ### merge in actual site series names
+rast <- rasterize(lBuff, rTemp, field = "ID")
+rast <- crop(rast, lBuff)
+plot(rast, main = "Raster Triangle")
+```
+
+#### 2. Accuracy Assessment
+
+This code produces 2 metrics - a overall accuracy proportion, and a confusion matrix.
+
+
+```{r aa}
+
+modSmall <- crop(mod, rast)
+plot(modSmall)
+plot(rast, add = T)
+rDiff <- rast - modSmall
+plot(rDiff, "Difference")
+aa <- length(rDiff[rDiff == 0])/length(rDiff[!is.na(rDiff)]) ###total prop same
+cat("The overal accuracy is: ", aa, "\n")
+
+########confusion matrix###############
+modVals <- mask(modSmall, rast)
+
+loopMerge <- function(x,y){## f'n to combine in loop
+  merge(x,y,by = "Model", all.x = T, all.y = T)
+}
+confMat <- foreach(val = unique(rast[!is.na(rast)]), .combine = loopMerge) %do% { ###loop through each call and count model calls
+ tTemp <- as.data.frame(table(modVals[rast == val]))
+ colnames(tTemp) <- c("Model",val)
+ #tTemp[,2] <- (tTemp[,2]/sum(tTemp[,2]))*100
+ tTemp
+}
+###rename to site series names
+temp <- as.character(modKey$category)
+names(temp) <- modKey$ID
+confMat$Model <- plyr::revalue(as.character(confMat$Model), temp)
+rownames(confMat) <- confMat$Model
+confMat <- confMat[,-1]
+colnames(confMat) <- plyr::revalue(colnames(confMat), temp)
+confMat <- confMat[,order(colnames(confMat))]
+
+print(confMat)
+```
+
+
