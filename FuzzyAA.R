@@ -10,6 +10,7 @@ library(raster)
 library(clhs)
 library(ranger)
 library(scales)
+Rcpp::sourceCpp('FuzzySpread.cpp')
 
 ##load covariates
 covDir <- "./InputData/Covariates/"
@@ -20,6 +21,28 @@ ancDat <- stack(paste0(covDir,covs))
 trDat <- st_read(dsn = "./InputData/", layer = "transect1_all_pts")
 trDat <- trDat[grep("SBSmc2",trDat$mapunit1),]
 trDat$id2 <- gsub("_[[:alpha:]].*","",trDat$id)
+
+# ##for buffer
+# trDat <- as.data.table(trDat)
+# legend <- data.table(Unit = as.character(unique(trDat$mapunit1)))
+# legend[,pID := seq_along(Unit)]
+# trDat[legend, pID := i.pID, on = c(mapunit1 = "Unit")]
+# trDat <- st_as_sf(trDat)
+# 
+# trRast <- rasterize(trDat,ancDat[[1]],field = "pID")
+# 
+# test <- foreach(unit = legend$pID, .combine = rbind) %do% {
+#   tempR <- trRast
+#   tempR[tempR != unit] <- NA
+#   mat1 <- as.matrix(tempR)
+#   
+#   ## spread to adjacent cells
+#   rSpread(mat1, diag = (unit-0.5), near = (unit-0.5)) ##updates mat1 in place
+#   values(tempR) <- mat1
+#   pts <- rasterToPoints(tempR,spatial = T) %>% st_as_sf()
+#   pts
+# }
+
 test <- raster::extract(ancDat, trDat)
 atts <- st_drop_geometry(trDat) %>% select ("mapunit1","mapunit2","id")
 trAll <- cbind(atts, test) %>% as.data.table()
@@ -63,7 +86,19 @@ bsRes <- foreach(it = 1:100, .combine = rbind) %do% {
                 splitrule = "extratrees",
                 classification = T)
   
-  smallR <- crop(ancDat,testDat_sf)
+  temp <- predict(mod,data = testDat,predict.all = T)
+  predMat <- as.data.table(temp$predictions)
+  predMat[,pID := seq_along(1:nrow(predMat))]
+  predMat[,mapunit1 := testDat$mapunit1]
+  predMat <- data.table::melt(predMat, id.vars = c("pID","mapunit1"))
+  predMat <- predMat[,.(Num = .N), by = .(mapunit1,pID,value)]
+  predMat[,Prop := Num/501]
+  leg2 <- data.table(UnitName = mod$forest$levels, ID = seq_along(mod$forest$levels))
+  predMat[leg2, PredUnit := i.UnitName, on = c(value = "ID")]
+  predMat[fMat, fVal := i.fVal, on = c("mapunit1",PredUnit = "Pred")]
+  predMat[,TotProp := Prop * fVal]
+  predMat <- predMat[complete.cases(predMat),]
+  
   testDat$Pred <- predict(mod,data = testDat)$predictions
   testDat <- testDat[,.(mapunit1,mapunit2,Pred)]
   testDat[fMat, fVal1 := i.fVal, on = c("mapunit1","Pred")]
@@ -73,14 +108,21 @@ bsRes <- foreach(it = 1:100, .combine = rbind) %do% {
   
   res <- foreach(unit = unique(testDat$mapunit1), .combine = rbind) %do% {
     sub <- testDat[mapunit1 == unit,]
+    sub2 <- predMat[mapunit1 == unit,]
     out <- data.table(Unit = unit, Acc1 = sum(sub$fVal1)/nrow(sub),
-                      Acc2 = sum(sub$fValMax)/nrow(sub))
+                      Acc2 = sum(sub$fValMax)/nrow(sub),
+                      Acc3 = sum(sub2$TotProp)/length(unique(sub2$pID)))
     out
   }
   res[,It := it]
   res
 }
 
+
+
+
+
+###old####
 bsRes[,Unit := as.factor(as.character(Unit))]
 boxplot(Acc2 ~ Unit, data = bsRes)
 bsRes <- data.table::melt(bsRes, id.vars = c("Unit","It"))
